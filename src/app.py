@@ -5,14 +5,133 @@ A super simple FastAPI application that allows students to view and sign up
 for extracurricular activities at Mergington High School.
 """
 
-from fastapi import FastAPI, HTTPException
-from fastapi.staticfiles import StaticFiles
-from fastapi.responses import RedirectResponse
+import hashlib
+import hmac
+import json
+import logging
 import os
+import secrets
 from pathlib import Path
 
-app = FastAPI(title="Mergington High School API",
-              description="API for viewing and signing up for extracurricular activities")
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.middleware import Middleware
+from fastapi.responses import RedirectResponse
+from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel
+from starlette.middleware.sessions import SessionMiddleware
+
+logger = logging.getLogger(__name__)
+session_secret = os.environ.get("SESSION_SECRET")
+if not session_secret:
+    logger.warning(
+        "SESSION_SECRET is not set; using a temporary session secret. "
+        "Set SESSION_SECRET to keep teacher sessions valid across restarts."
+    )
+    session_secret = secrets.token_urlsafe(32)
+
+app = FastAPI(
+    title="Mergington High School API",
+    description="API for viewing and signing up for extracurricular activities",
+    middleware=[
+        Middleware(
+            SessionMiddleware,
+            secret_key=session_secret,
+            same_site="strict",
+            https_only=os.environ.get("COOKIE_SECURE", "").lower() == "true",
+        )
+    ],
+)
+
+credentials_file = Path(
+    os.environ.get(
+        "TEACHER_CREDENTIALS_FILE",
+        Path(__file__).parent / "teacher_credentials.json",
+    )
+)
+
+
+class LoginRequest(BaseModel):
+    username: str
+    password: str
+
+
+def load_teacher_credentials():
+    try:
+        credentials = json.loads(credentials_file.read_text(encoding="utf-8"))
+    except FileNotFoundError as error:
+        raise HTTPException(
+            status_code=503,
+            detail="Teacher login is not configured.",
+        ) from error
+    except (OSError, json.JSONDecodeError) as error:
+        logger.exception("Could not read teacher credentials")
+        raise HTTPException(
+            status_code=500,
+            detail="Teacher credentials configuration is invalid.",
+        ) from error
+
+    teachers = credentials.get("teachers") if isinstance(credentials, dict) else None
+    if not isinstance(teachers, list):
+        raise HTTPException(
+            status_code=500,
+            detail="Teacher credentials configuration is invalid.",
+        )
+    return teachers
+
+
+def require_teacher(request: Request):
+    username = request.session.get("teacher")
+    if not username:
+        raise HTTPException(status_code=401, detail="Teacher login required.")
+    return username
+
+
+@app.post("/auth/login")
+def login(credentials: LoginRequest, request: Request):
+    for teacher in load_teacher_credentials():
+        if not isinstance(teacher, dict) or teacher.get("username") != credentials.username:
+            continue
+
+        salt = teacher.get("salt")
+        stored_hash = teacher.get("password_hash")
+        iterations = teacher.get("iterations")
+        if (
+            not isinstance(salt, str)
+            or not isinstance(stored_hash, str)
+            or not isinstance(iterations, int)
+            or isinstance(iterations, bool)
+            or not 100_000 <= iterations <= 1_000_000
+        ):
+            raise HTTPException(
+                status_code=500,
+                detail="Teacher credentials configuration is invalid.",
+            )
+
+        candidate_hash = hashlib.pbkdf2_hmac(
+            "sha256",
+            credentials.password.encode("utf-8"),
+            salt.encode("utf-8"),
+            iterations,
+        ).hex()
+        if hmac.compare_digest(candidate_hash, stored_hash):
+            request.session.clear()
+            request.session["teacher"] = credentials.username
+            return {"authenticated": True, "username": credentials.username}
+        break
+
+    raise HTTPException(status_code=401, detail="Invalid username or password.")
+
+
+@app.get("/auth/status")
+def auth_status(request: Request):
+    username = request.session.get("teacher")
+    return {"authenticated": bool(username), "username": username}
+
+
+@app.post("/auth/logout")
+def logout(request: Request):
+    request.session.clear()
+    return {"authenticated": False}
 
 # Mount the static files directory
 current_dir = Path(__file__).parent
@@ -89,8 +208,10 @@ def get_activities():
 
 
 @app.post("/activities/{activity_name}/signup")
-def signup_for_activity(activity_name: str, email: str):
+def signup_for_activity(activity_name: str, email: str, request: Request):
     """Sign up a student for an activity"""
+    require_teacher(request)
+
     # Validate activity exists
     if activity_name not in activities:
         raise HTTPException(status_code=404, detail="Activity not found")
@@ -111,8 +232,10 @@ def signup_for_activity(activity_name: str, email: str):
 
 
 @app.delete("/activities/{activity_name}/unregister")
-def unregister_from_activity(activity_name: str, email: str):
+def unregister_from_activity(activity_name: str, email: str, request: Request):
     """Unregister a student from an activity"""
+    require_teacher(request)
+
     # Validate activity exists
     if activity_name not in activities:
         raise HTTPException(status_code=404, detail="Activity not found")
